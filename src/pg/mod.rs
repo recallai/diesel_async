@@ -238,6 +238,27 @@ fn type_from_oid(t: &PgTypeMetadata) -> QueryResult<Type> {
 }
 
 impl AsyncPgConnection {
+    /// Execute fixed SQL through the simple protocol and retain its text results.
+    ///
+    /// This reuses the existing connection without preparing a statement. Use it
+    /// for fixed, parameterless reads such as the database clock. For values from
+    /// callers, use Diesel's bound queries instead of interpolating SQL strings.
+    /// Result fields are text, unlike Diesel's binary PostgreSQL row values.
+    /// Manage transactions through Diesel's transaction APIs, not SQL commands
+    /// passed to this method.
+    pub async fn simple_query(
+        &mut self,
+        query: &str,
+    ) -> QueryResult<Vec<tokio_postgres::SimpleQueryMessage>> {
+        let result = self
+            .conn
+            .simple_query(query)
+            .await
+            .map_err(|err| ErrorHelper(err).into());
+        let mut tm = self.transaction_state.lock().await;
+        update_transaction_manager_status(result, &mut tm)
+    }
+
     /// Build a transaction, specifying additional details such as isolation level
     ///
     /// See [`TransactionBuilder`] for more examples.

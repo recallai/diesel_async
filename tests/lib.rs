@@ -12,6 +12,8 @@ mod pooling;
 #[cfg(feature = "async-connection-wrapper")]
 mod sync_wrapper;
 mod type_check;
+#[cfg(feature = "postgres")]
+mod simple_query;
 
 async fn transaction_test(conn: &mut TestConnection) -> QueryResult<()> {
     let res = conn
