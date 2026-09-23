@@ -48,7 +48,7 @@ impl FromSql<MyType, Pg> for MyEnum {
     }
 }
 
-#[derive(Insertable, Queryable, Identifiable, Debug, PartialEq)]
+#[derive(Insertable, Queryable, QueryableByName, Identifiable, Debug, PartialEq)]
 #[diesel(table_name = custom_types)]
 struct HasCustomTypes {
     id: i32,
@@ -87,6 +87,21 @@ async fn custom_types_round_trip() {
         .await
         .unwrap();
     assert_eq!(data, inserted);
+
+    let raw: HasCustomTypes = sql_query("SELECT $1 AS id, $2 AS custom_enum")
+        .into_boxed::<Pg>()
+        .bind::<diesel::sql_types::Integer, _>(3)
+        .bind::<MyType, _>(MyEnum::Bar)
+        .get_result(connection)
+        .await
+        .unwrap();
+    assert_eq!(
+        raw,
+        HasCustomTypes {
+            id: 3,
+            custom_enum: MyEnum::Bar
+        }
+    );
 }
 
 table! {
@@ -129,7 +144,7 @@ impl FromSql<MyTypeInCustomSchema, Pg> for MyEnumInCustomSchema {
     }
 }
 
-#[derive(Insertable, Queryable, Identifiable, Debug, PartialEq)]
+#[derive(Insertable, Queryable, QueryableByName, Identifiable, Debug, PartialEq)]
 #[diesel(table_name = custom_types_with_custom_schema)]
 struct HasCustomTypesInCustomSchema {
     id: i32,
@@ -169,4 +184,19 @@ async fn custom_types_in_custom_schema_round_trip() {
         .await
         .unwrap();
     assert_eq!(data, inserted);
+
+    let raw: HasCustomTypesInCustomSchema = sql_query("SELECT $1 AS id, $2 AS custom_enum")
+        .into_boxed::<Pg>()
+        .bind::<diesel::sql_types::Integer, _>(3)
+        .bind::<MyTypeInCustomSchema, _>(MyEnumInCustomSchema::Bar)
+        .get_result(connection)
+        .await
+        .unwrap();
+    assert_eq!(
+        raw,
+        HasCustomTypesInCustomSchema {
+            id: 3,
+            custom_enum: MyEnumInCustomSchema::Bar
+        }
+    );
 }

@@ -99,9 +99,15 @@ mod transaction_builder;
 /// # }
 pub struct AsyncPgConnection {
     conn: Arc<tokio_postgres::Client>,
-    stmt_cache: Arc<Mutex<StmtCache<diesel::pg::Pg, Statement>>>,
+    stmt_cache: Arc<Mutex<StmtCache<diesel::pg::Pg, PgStatement>>>,
     transaction_state: Arc<Mutex<AnsiTransactionManager>>,
     metadata_cache: Arc<Mutex<PgMetadataCache>>,
+}
+
+#[derive(Clone)]
+enum PgStatement {
+    Prepared(Statement),
+    Unnamed { sql: String, bind_types: Vec<Type> },
 }
 
 #[async_trait::async_trait]
@@ -139,7 +145,14 @@ impl AsyncConnection for AsyncPgConnection {
     {
         let query = source.as_query();
         self.with_prepared_statement(query, |conn, stmt, binds| async move {
-            let res = conn.query_raw(&stmt, binds).await.map_err(ErrorHelper)?;
+            let res = match stmt {
+                PgStatement::Prepared(stmt) => conn.query_raw(&stmt, binds).await,
+                PgStatement::Unnamed { sql, bind_types } => {
+                    conn.query_typed_raw(&sql, binds.into_iter().zip(bind_types))
+                        .await
+                }
+            }
+            .map_err(ErrorHelper)?;
 
             Ok(res
                 .map_err(|e| diesel::result::Error::from(ErrorHelper(e)))
@@ -157,14 +170,26 @@ impl AsyncConnection for AsyncPgConnection {
         T: QueryFragment<Self::Backend> + QueryId + 'query,
     {
         self.with_prepared_statement(source, |conn, stmt, binds| async move {
-            let binds = binds
-                .iter()
-                .map(|b| b as &(dyn ToSql + Sync))
-                .collect::<Vec<_>>();
-
-            let res = tokio_postgres::Client::execute(&conn, &stmt, &binds as &[_])
-                .await
-                .map_err(ErrorHelper)?;
+            let res = match stmt {
+                PgStatement::Prepared(stmt) => {
+                    let binds = binds
+                        .iter()
+                        .map(|b| b as &(dyn ToSql + Sync))
+                        .collect::<Vec<_>>();
+                    conn.execute(&stmt, &binds).await.map_err(ErrorHelper)?
+                }
+                PgStatement::Unnamed { sql, bind_types } => {
+                    let rows = conn
+                        .query_typed_raw(&sql, binds.into_iter().zip(bind_types))
+                        .await
+                        .map_err(ErrorHelper)?;
+                    futures_util::pin_mut!(rows);
+                    // Drain through CommandComplete, including any RETURNING rows,
+                    // to preserve execute's row count and surface execution errors.
+                    while rows.try_next().await.map_err(ErrorHelper)?.is_some() {}
+                    rows.rows_affected().unwrap_or(0)
+                }
+            };
             Ok(res as usize)
         })
         .boxed()
@@ -200,23 +225,36 @@ fn update_transaction_manager_status<T>(
 }
 
 #[async_trait::async_trait]
-impl PrepareCallback<Statement, PgTypeMetadata> for Arc<tokio_postgres::Client> {
+impl PrepareCallback<PgStatement, PgTypeMetadata> for Arc<tokio_postgres::Client> {
     async fn prepare(
         self,
         sql: &str,
         metadata: &[PgTypeMetadata],
-        _is_for_cache: PrepareForCache,
-    ) -> QueryResult<(Statement, Self)> {
+        is_for_cache: PrepareForCache,
+    ) -> QueryResult<(PgStatement, Self)> {
         let bind_types = metadata
             .iter()
             .map(type_from_oid)
             .collect::<QueryResult<Vec<_>>>()?;
 
+        // Uncacheable queries cannot reuse a named statement. Send Parse, Bind,
+        // Describe, and Execute together using the unnamed statement instead of
+        // paying for a separate prepare followed by execute and close.
+        if let PrepareForCache::No = is_for_cache {
+            return Ok((
+                PgStatement::Unnamed {
+                    sql: sql.to_owned(),
+                    bind_types,
+                },
+                self,
+            ));
+        }
+
         let stmt = self
             .prepare_typed(sql, &bind_types)
             .await
             .map_err(ErrorHelper);
-        Ok((stmt?, self))
+        Ok((PgStatement::Prepared(stmt?), self))
     }
 }
 
@@ -302,7 +340,9 @@ impl AsyncPgConnection {
     fn with_prepared_statement<'a, T, F, R>(
         &mut self,
         query: T,
-        callback: impl FnOnce(Arc<tokio_postgres::Client>, Statement, Vec<ToSqlHelper>) -> F + Send + 'a,
+        callback: impl FnOnce(Arc<tokio_postgres::Client>, PgStatement, Vec<ToSqlHelper>) -> F
+            + Send
+            + 'a,
     ) -> BoxFuture<'a, QueryResult<R>>
     where
         T: QueryFragment<diesel::pg::Pg> + QueryId,
