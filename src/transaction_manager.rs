@@ -7,6 +7,8 @@ use diesel::QueryResult;
 use scoped_futures::ScopedBoxFuture;
 use std::borrow::Cow;
 use std::num::NonZeroU32;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use crate::AsyncConnection;
 // TODO: refactor this to share more code with diesel
@@ -87,24 +89,31 @@ pub trait TransactionManager<Conn: AsyncConnection>: Send {
     /// in an error state.
     #[doc(hidden)]
     fn is_broken_transaction_manager(conn: &mut Conn) -> bool {
-        match Self::transaction_manager_status_mut(conn).transaction_state() {
-            // all transactions are closed
-            // so we don't consider this connection broken
-            Ok(ValidTransactionManagerStatus {
-                in_transaction: None,
-                ..
-            }) => false,
-            // The transaction manager is in an error state
-            // Therefore we consider this connection broken
-            Err(_) => true,
-            // The transaction manager contains a open transaction
-            // we do consider this connection broken
-            // if that transaction was not opened by `begin_test_transaction`
-            Ok(ValidTransactionManagerStatus {
-                in_transaction: Some(s),
-                ..
-            }) => !s.test_transaction,
-        }
+        check_broken_transaction_state(conn)
+    }
+}
+
+fn check_broken_transaction_state<Conn>(conn: &mut Conn) -> bool
+where
+    Conn: AsyncConnection,
+{
+    match Conn::TransactionManager::transaction_manager_status_mut(conn).transaction_state() {
+        // all transactions are closed
+        // so we don't consider this connection broken
+        Ok(ValidTransactionManagerStatus {
+            in_transaction: None,
+            ..
+        }) => false,
+        // The transaction manager is in an error state
+        // Therefore we consider this connection broken
+        Err(_) => true,
+        // The transaction manager contains a open transaction
+        // we do consider this connection broken
+        // if that transaction was not opened by `begin_test_transaction`
+        Ok(ValidTransactionManagerStatus {
+            in_transaction: Some(s),
+            ..
+        }) => !s.test_transaction,
     }
 }
 
@@ -113,6 +122,11 @@ pub trait TransactionManager<Conn: AsyncConnection>: Send {
 #[derive(Default, Debug)]
 pub struct AnsiTransactionManager {
     pub(crate) status: TransactionManagerStatus,
+    // A cancelled transaction command can leave the server state out of sync
+    // with the local transaction depth. Keep this set until the command returns
+    // so connection pools discard the connection if its future is dropped.
+    // Backported from https://github.com/diesel-rs/diesel_async/issues/198.
+    pub(crate) is_broken: Arc<AtomicBool>,
 }
 
 // /// Status of the transaction manager
@@ -273,16 +287,33 @@ impl AnsiTransactionManager {
     where
         Conn: AsyncConnection<TransactionManager = Self>,
     {
+        let is_broken = conn.transaction_state().is_broken.clone();
         let state = Self::get_transaction_state(conn)?;
         match state.transaction_depth() {
             None => {
-                conn.batch_execute(sql).await?;
+                Self::critical_transaction_block(&is_broken, conn.batch_execute(sql)).await?;
                 Self::get_transaction_state(conn)?
                     .change_transaction_depth(TransactionDepthChange::IncreaseDepth)?;
                 Ok(())
             }
             Some(_depth) => Err(Error::AlreadyInTransaction),
         }
+    }
+
+    // Every transaction command must be awaited through this helper. If the
+    // future is dropped, is_broken stays set regardless of transaction depth.
+    async fn critical_transaction_block<F>(is_broken: &AtomicBool, f: F) -> F::Output
+    where
+        F: std::future::Future,
+    {
+        let was_broken = is_broken.swap(true, Ordering::Relaxed);
+        debug_assert!(
+            !was_broken,
+            "Tried to execute transaction SQL on a previously cancelled transaction manager"
+        );
+        let res = f.await;
+        is_broken.store(false, Ordering::Relaxed);
+        res
     }
 }
 
@@ -301,7 +332,11 @@ where
                 Cow::from(format!("SAVEPOINT diesel_savepoint_{transaction_depth}"))
             }
         };
-        conn.batch_execute(&start_transaction_sql).await?;
+        Self::critical_transaction_block(
+            &conn.transaction_state().is_broken.clone(),
+            conn.batch_execute(&start_transaction_sql),
+        )
+        .await?;
         Self::get_transaction_state(conn)?
             .change_transaction_depth(TransactionDepthChange::IncreaseDepth)?;
 
@@ -331,7 +366,9 @@ where
             None => return Err(Error::NotInTransaction),
         };
 
-        match conn.batch_execute(&rollback_sql).await {
+        let is_broken = conn.transaction_state().is_broken.clone();
+        match Self::critical_transaction_block(&is_broken, conn.batch_execute(&rollback_sql)).await
+        {
             Ok(()) => {
                 match Self::get_transaction_state(conn)?
                     .change_transaction_depth(TransactionDepthChange::DecreaseDepth)
@@ -410,7 +447,8 @@ where
                 false,
             ),
         };
-        match conn.batch_execute(&commit_sql).await {
+        let is_broken = conn.transaction_state().is_broken.clone();
+        match Self::critical_transaction_block(&is_broken, conn.batch_execute(&commit_sql)).await {
             Ok(()) => {
                 match Self::get_transaction_state(conn)?
                     .change_transaction_depth(TransactionDepthChange::DecreaseDepth)
@@ -434,6 +472,7 @@ where
                     ..
                 }) = conn.transaction_state().status
                 {
+                    // rollback_transaction already guards its transaction command.
                     match Self::rollback_transaction(conn).await {
                         Ok(()) => {}
                         Err(rollback_error) => {
@@ -452,5 +491,10 @@ where
 
     fn transaction_manager_status_mut(conn: &mut Conn) -> &mut TransactionManagerStatus {
         &mut conn.transaction_state().status
+    }
+
+    fn is_broken_transaction_manager(conn: &mut Conn) -> bool {
+        conn.transaction_state().is_broken.load(Ordering::Relaxed)
+            || check_broken_transaction_state(conn)
     }
 }

@@ -14,6 +14,8 @@ mod sync_wrapper;
 mod type_check;
 #[cfg(feature = "postgres")]
 mod simple_query;
+#[cfg(feature = "postgres")]
+mod transaction_cancellation;
 
 async fn transaction_test(conn: &mut TestConnection) -> QueryResult<()> {
     let res = conn
